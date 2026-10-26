@@ -7,6 +7,8 @@ from typing import Any
 from xml.etree import ElementTree
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 BASE_URL = "https://opendart.fss.or.kr/api"
@@ -22,7 +24,7 @@ class DartAPIError(RuntimeError):
 
 
 class DartClient:
-    def __init__(self, api_key: str, timeout: int = 60) -> None:
+    def __init__(self, api_key: str, timeout: int = 30) -> None:
         if not api_key:
             raise ValueError(
                 f"{API_KEY_ENV} 환경변수가 비어 있습니다. GitHub Actions Secret을 확인하세요."
@@ -30,6 +32,24 @@ class DartClient:
         self.api_key = api_key
         self.timeout = timeout
         self.session = requests.Session()
+
+        # OpenDART occasionally has transient connection failures. Retry only
+        # safe GET requests and use exponential backoff instead of failing at once.
+        retry = Retry(
+            total=4,
+            connect=4,
+            read=3,
+            status=3,
+            backoff_factor=2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers.update({"User-Agent": "JH-SKhynix-DART-Agent/1.0"})
 
     @classmethod
     def from_environment(cls) -> "DartClient":
@@ -39,13 +59,21 @@ class DartClient:
         )
 
     def _get(self, endpoint: str, **params: str) -> requests.Response:
-        response = self.session.get(
-            f"{BASE_URL}/{endpoint}",
-            params={"crtfc_key": self.api_key, **params},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return response
+        try:
+            response = self.session.get(
+                f"{BASE_URL}/{endpoint}",
+                params={"crtfc_key": self.api_key, **params},
+                timeout=(10, self.timeout),
+            )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            # Do not include the request URL because it contains the API key.
+            raise DartAPIError(
+                f"OpenDART 연결 실패({endpoint}): {type(exc).__name__}. "
+                "일시적인 OpenDART 네트워크 장애일 수 있습니다. "
+                "잠시 후 GitHub Actions를 재실행하세요."
+            ) from exc
 
     def _get_json(self, endpoint: str, **params: str) -> dict[str, Any]:
         payload = self._get(endpoint, **params).json()
@@ -58,11 +86,18 @@ class DartClient:
         return payload
 
     def corporation_codes(self) -> list[dict[str, str]]:
-        with zipfile.ZipFile(io.BytesIO(self._get("corpCode.xml").content)) as archive:
-            xml_name = next(
-                name for name in archive.namelist() if name.lower().endswith(".xml")
-            )
-            root = ElementTree.fromstring(archive.read(xml_name))
+        response = self._get("corpCode.xml")
+        try:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                xml_name = next(
+                    name for name in archive.namelist() if name.lower().endswith(".xml")
+                )
+                root = ElementTree.fromstring(archive.read(xml_name))
+        except (zipfile.BadZipFile, StopIteration, ElementTree.ParseError) as exc:
+            raise DartAPIError(
+                "OpenDART corpCode.xml 응답을 해석할 수 없습니다. 잠시 후 다시 실행하세요."
+            ) from exc
+
         return [
             {child.tag: (child.text or "").strip() for child in item}
             for item in root.findall("list")
@@ -88,4 +123,3 @@ class DartClient:
             reprt_code=report_code,
             fs_div=fs_div,
         )
-
