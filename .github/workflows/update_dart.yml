@@ -26,6 +26,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Data collection can take several minutes; fetch full history so
+          # we can rebase generated data on changes made during the run.
+          fetch-depth: 0
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -51,12 +55,30 @@ jobs:
         run: python -m src.dashboard
       - name: Commit refreshed data
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data docs/dashboard-data.js
           if ! git diff --cached --quiet; then
             git commit -m "chore: refresh SK hynix DART data"
-            git push
+
+            # main may have changed while OpenDART data was being collected.
+            # Rebase the generated-data commit onto the newest main, then push.
+            for attempt in 1 2 3; do
+              git fetch origin main
+              if ! git rebase -X theirs origin/main; then
+                git rebase --abort || true
+                echo "Rebase failed; generated data could not be safely integrated." >&2
+                exit 1
+              fi
+              if git push origin HEAD:main; then
+                exit 0
+              fi
+              echo "Push attempt ${attempt} failed; retrying against latest main..."
+            done
+
+            echo "Unable to push refreshed data after 3 attempts." >&2
+            exit 1
           fi
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -67,4 +89,3 @@ jobs:
       - name: Deploy dashboard
         id: deployment
         uses: actions/deploy-pages@v4
-
